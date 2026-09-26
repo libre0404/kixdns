@@ -33,9 +33,17 @@ jobs:
           test -s "$BIN"
 
           file "$BIN"
-          readelf -h "$BIN" | grep -E 'Class:|Machine:'
+          readelf -h "$BIN" | grep -E 'Class:|Machine:|Flags:'
+          if ! readelf -h "$BIN" | grep -q 'Machine:.*ARM'; then
+            echo "Error: output is not ARM" >&2
+            exit 1
+          fi
           if readelf -l "$BIN" | grep -q INTERP; then
-            echo "Error: binary still requires a dynamic loader" >&2
+            echo "Error: binary requires a dynamic loader" >&2
+            exit 1
+          fi
+          if readelf -d "$BIN" 2>/dev/null | grep -q '(NEEDED)'; then
+            echo "Error: binary requires shared libraries" >&2
             exit 1
           fi
 
