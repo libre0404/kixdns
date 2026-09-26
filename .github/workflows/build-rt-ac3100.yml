@@ -1,0 +1,58 @@
+name: Build KixDNS for RT-AC3100
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build ARMv7 soft-float static binary
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/home/rust/src" \
+            -w /home/rust/src \
+            -e CARGO_BUILD_JOBS=2 \
+            ghcr.io/rust-cross/rust-musl-cross:armv7-musleabi \
+            cargo build --locked --release \
+              --target armv7-unknown-linux-musleabi
+
+      - name: Check binary and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=target/armv7-unknown-linux-musleabi/release/kixdns
+          test -s "$BIN"
+
+          file "$BIN"
+          readelf -h "$BIN" | grep -E 'Class:|Machine:'
+          if readelf -l "$BIN" | grep -q INTERP; then
+            echo "Error: binary still requires a dynamic loader" >&2
+            exit 1
+          fi
+
+          mkdir -p dist
+          cp "$BIN" dist/kixdns
+          chmod 0755 dist/kixdns
+          cp config/pipeline.json dist/pipeline.json
+          tar -C dist -czf kixdns-rt-ac3100-armv7-musleabi.tar.gz \
+            kixdns pipeline.json
+          sha256sum kixdns-rt-ac3100-armv7-musleabi.tar.gz \
+            > kixdns-rt-ac3100-armv7-musleabi.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kixdns-rt-ac3100-armv7-musleabi
+          path: |
+            kixdns-rt-ac3100-armv7-musleabi.tar.gz
+            kixdns-rt-ac3100-armv7-musleabi.tar.gz.sha256
+          if-no-files-found: error
