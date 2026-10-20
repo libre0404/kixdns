@@ -1,66 +1,332 @@
-name: Build KixDNS for RT-AC3100
+name: Build
 
 on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  release:
+    types: [ created ]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+  build-windows:
+    name: Build Windows ${{ matrix.arch }} gnullvm
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-gnullvm
+            arch: x86_64
+            runner: windows-latest
+          - target: aarch64-pc-windows-gnullvm
+            arch: arm64
+            runner: windows-11-arm
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v6
 
-      - name: Build ARMv7 soft-float static binary
-        run: |
-          docker run --rm \
-            -v "$GITHUB_WORKSPACE:/home/rust/src" \
-            -w /home/rust/src \
-            -e CARGO_BUILD_JOBS=2 \
-            ghcr.io/rust-cross/rust-musl-cross:armv7-musleabi \
-            cargo build --locked --release \
-              --target armv7-unknown-linux-musleabi
-
-      - name: Check binary and package
-        shell: bash
-        run: |
-          set -euo pipefail
-          BIN=target/armv7-unknown-linux-musleabi/release/kixdns
-          test -s "$BIN"
-
-          file "$BIN"
-          readelf -h "$BIN" | grep -E 'Class:|Machine:|Flags:'
-          if ! readelf -h "$BIN" | grep -q 'Machine:.*ARM'; then
-            echo "Error: output is not ARM" >&2
-            exit 1
-          fi
-          if readelf -l "$BIN" | grep -q INTERP; then
-            echo "Error: binary requires a dynamic loader" >&2
-            exit 1
-          fi
-          if readelf -d "$BIN" 2>/dev/null | grep -q '(NEEDED)'; then
-            echo "Error: binary requires shared libraries" >&2
-            exit 1
-          fi
-
-          mkdir -p dist
-          cp "$BIN" dist/kixdns
-          chmod 0755 dist/kixdns
-          cp config/pipeline.json dist/pipeline.json
-          tar -C dist -czf kixdns-rt-ac3100-armv7-musleabi.tar.gz \
-            kixdns pipeline.json
-          sha256sum kixdns-rt-ac3100-armv7-musleabi.tar.gz \
-            > kixdns-rt-ac3100-armv7-musleabi.tar.gz.sha256
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Install MSYS2 x86_64 toolchain
+        if: matrix.arch == 'x86_64'
+        uses: msys2/setup-msys2@v2
         with:
-          name: kixdns-rt-ac3100-armv7-musleabi
+          msystem: CLANG64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-lld
+            mingw-w64-clang-x86_64-llvm
+            mingw-w64-clang-x86_64-rust
+
+      - name: Install MSYS2 aarch64 toolchain
+        if: matrix.arch == 'arm64'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          update: true
+          install: >-
+            mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-lld
+            mingw-w64-clang-aarch64-llvm
+            mingw-w64-clang-aarch64-rust
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          strip target/${{ matrix.target }}/release/kixdns.exe || true
+
+      - name: Package
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/kixdns.exe dist/kixdns-windows-${{ matrix.arch }}.exe
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kixdns-windows-${{ matrix.arch }}.exe
+          path: dist/kixdns-windows-${{ matrix.arch }}.exe
+          retention-days: 30
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/kixdns-windows-${{ matrix.arch }}.exe
+
+  build-linux:
+    name: Build Linux ${{ matrix.arch }} ${{ matrix.toolset }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            runner: ubuntu-24.04
+            toolset: gnu
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            toolset: gnu
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+            runner: ubuntu-24.04
+            toolset: musl
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            toolset: musl
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install musl toolchain
+        if: matrix.toolset == 'musl'
+        run: |
+          sudo apt update
+          sudo apt install -y musl-tools musl-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          strip target/${{ matrix.target }}/release/kixdns || true
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/kixdns dist/kixdns-linux-${{ matrix.arch }}-${{ matrix.toolset }}
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kixdns-linux-${{ matrix.arch }}-${{ matrix.toolset }}
+          path: dist/kixdns-linux-${{ matrix.arch }}-${{ matrix.toolset }}
+          retention-days: 30
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/kixdns-linux-${{ matrix.arch }}-${{ matrix.toolset }}
+
+  build-linux-armv5:
+    name: Build Linux armv5te musl (ASUS RT-AC3100 compatible)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v5
+        with:
           path: |
-            kixdns-rt-ac3100-armv7-musleabi.tar.gz
-            kixdns-rt-ac3100-armv7-musleabi.tar.gz.sha256
-          if-no-files-found: error
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-armv5te-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-armv5te-
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv5te-unknown-linux-musleabi
+
+      - name: Install cross
+        run: |
+          if ! command -v cross >/dev/null 2>&1; then
+            cargo install cross --locked
+          else
+            echo "cross already installed, skip install"
+          fi
+
+      - name: Build armv5te static binary
+        run: |
+          cross build --release --target armv5te-unknown-linux-musleabi
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/armv5te-unknown-linux-musleabi/release/kixdns \
+            dist/kixdns-linux-armv5te-musleabi
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kixdns-linux-armv5te-musleabi
+          path: dist/kixdns-linux-armv5te-musleabi
+          retention-days: 30
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/kixdns-linux-armv5te-musleabi
+
+  build-freebsd:
+    name: Build FreeBSD ${{ matrix.arch }} (cross)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-freebsd
+            arch: x86_64
+            toolchain: stable
+            build_std: ""
+          - target: aarch64-unknown-freebsd
+            arch: arm64
+            toolchain: nightly
+            build_std: "-Z build-std=std,panic_abort"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ matrix.toolchain }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.toolchain }}-
+
+      - name: Cache target (per target)
+        uses: actions/cache@v5
+        with:
+          path: target/${{ matrix.target }}
+          key: ${{ runner.os }}-target-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ matrix.target }}-
+
+      - name: Install toolchain and cross
+        run: |
+          if ! command -v cross >/dev/null 2>&1; then
+            cargo install cross --git https://github.com/cross-rs/cross
+          else
+            echo "cross already installed, skip install"
+          fi
+          rustup toolchain install ${{ matrix.toolchain }}
+          rustup component add rust-src --toolchain ${{ matrix.toolchain }}
+
+      - name: Build FreeBSD ${{ matrix.arch }}
+        run: |
+          if [ -n "${{ matrix.build_std }}" ]; then
+            cross +${{ matrix.toolchain }} build --target ${{ matrix.target }} ${{ matrix.build_std }} --release
+          else
+            cross +${{ matrix.toolchain }} build --target ${{ matrix.target }} --release
+          fi
+          strip target/${{ matrix.target }}/release/kixdns || true
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/kixdns dist/kixdns-freebsd-${{ matrix.arch }}
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kixdns-freebsd-${{ matrix.arch }}
+          path: dist/kixdns-freebsd-${{ matrix.arch }}
+          retention-days: 30
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/kixdns-freebsd-${{ matrix.arch }}
+
+  test-linux:
+    name: Test Linux (unit + DoH integration)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run unit tests
+        run: cargo test --lib
+
+      - name: Run listener integration tests
+        run: cargo test --bin kixdns
+
+      - name: Run DoH integration tests
+        run: cargo test --test doh_integration
+
+      - name: Run response log tests
+        run: cargo test --test response_log
+
+  lint-linux:
+    name: Lint (clippy + fmt)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  audit-linux:
+    name: Audit dependencies (RustSec)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit Cargo.lock against the RustSec advisory database
+        run: cargo audit --deny warnings
